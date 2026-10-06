@@ -19,3 +19,11 @@ checkpoints/
 results/
 *.zip
 *.json
+
+# Datasets and large binary logs
+data/
+*.bag
+
+# Overleaf export packages
+overleaf_package/
+overleaf_package.zip
