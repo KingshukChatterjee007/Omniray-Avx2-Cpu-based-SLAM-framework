@@ -1,0 +1,423 @@
+\documentclass[conference]{IEEEtran}
+
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{subcaption}
+\usepackage{hyperref}
+
+\title{OmniRay: A CPU-Based Autonomous Active SLAM Framework with Adaptive Curriculum Learning and AVX2 Acceleration}
+
+\author{
+\IEEEauthorblockN{Kingshuk Chatterjee}
+\IEEEauthorblockA{Department of Computer Science \& Engineering\\
+KIIT Deemed to be University\\
+Bhubaneswar, Odisha, India\\
+kingshuk.chatterjee770@gmail.com}
+\and
+\IEEEauthorblockN{Ayush Ranjan}
+\IEEEauthorblockA{Department of Computer Science \& Engineering\\
+KIIT Deemed to be University\\
+Bhubaneswar, Odisha, India\\
+ranjanayush881@gmail.com}
+\and
+\IEEEauthorblockN{Raghav Singh Parihar}
+\IEEEauthorblockA{Department of Computer Science \& Engineering\\
+Oriental Institute of Science and Technology\\
+Bhopal, Madhya Pradesh, India\\
+raghavsp2007@gmail.com}
+\and
+% TODO: confirm department and email spelling with N Sangita Achary
+\IEEEauthorblockN{N Sangita Achary}
+\IEEEauthorblockA{Department of Computer Science \& Engineering\\
+KIIT Deemed to be University\\
+Bhubaneswar, Odisha, India\\
+sangita.acharyfcs@kiit.ac.in}
+}
+
+\begin{document}
+
+\maketitle
+
+% ============================================================================
+\begin{abstract}
+Autonomous Active SLAM requires mobile robots to maximize map exploration while maintaining localisation accuracy under physical sensor and actuator uncertainty. Existing deep reinforcement learning (DRL) navigation frameworks rely on power-intensive GPU clusters and static reward functions, making them impractical for resource-constrained mobile robots. We present \textbf{OmniRay}, an ultra-lightweight, CPU-native DRL framework for Active SLAM that combines a cross-platform C++ SIMD raycaster (supporting x86\_64 AVX2 and ARM64 NEON at $37\,\mu\text{s}$ per scan) with a 5-layer self-adaptive autonomy stack (health monitoring, dynamic reward adaptation, meta-policy tuning, curriculum management, and continual learning). OmniRay achieves 35--47 FPS policy training directly on a consumer ultrabook CPU ($<$15\,W) without GPU acceleration. Multi-seed benchmarks across seven models reveal that OmniRay learns an emergent spiral-like trajectory that eliminates discrete turn-in-place slipping, achieving $90.87 \pm 3.29\%$ mean coverage on the Intel Lab floorplan with 67.6\% fewer collisions than Yamauchi's frontier baseline. Zero-shot transfer to the unseen MIT Stata Center yields $91.08 \pm 3.99\%$ coverage without retraining, while maintaining constant-time $O(1)$ policy decision latency.
+\end{abstract}
+
+% ============================================================================
+\section{Introduction}
+
+Autonomous exploration and mapping in unknown environments (\textit{Active SLAM}) is foundational for mobile robotics in search-and-rescue, planetary exploration, and inspection~\cite{thrun2005}. Active SLAM requires simultaneously maximizing map coverage and minimizing localisation uncertainty. Classical methods like Yamauchi's frontier exploration~\cite{yamauchi1997} compute deterministic paths toward frontier centroids, but suffer from two key failure modes: (i)~\textit{kinodynamic instability}, where discrete stop-rotate-drive maneuvers amplify rotational errors under physical wheel slip, triggering wall collisions; and (ii)~\textit{brittle heuristics} unable to adapt to sensor dropouts or particle drift.
+
+Deep Reinforcement Learning (DRL) offers reactive, end-to-end policy learning, but modern frameworks (e.g., Habitat~\cite{savva2019}, Isaac Gym~\cite{makoviychuk2021}) depend on high-power GPU clusters consuming hundreds of watts, precluding on-device edge training. Furthermore, standard Proximal Policy Optimization (PPO)~\cite{schulman2017} requires millions of interactions to balance obstacle avoidance and exploration simultaneously.
+
+To overcome these constraints, we propose \textbf{OmniRay}, an ultra-lightweight, CPU-native Active SLAM framework.
+
+\noindent\textbf{Contributions.}
+\begin{enumerate}
+    \item A \textbf{5-layer self-adaptive autonomy architecture} that dynamically modulates environment difficulty, reward weights, and policy parameters during training and deployment.
+    \item A \textbf{C++ AVX2/NEON SIMD parallel raycaster} evaluating 128 LiDAR rays against arbitrary 2D wall segments in $37\,\mu\text{s}$ per scan---a $25.9\times$ speedup over scalar C++ execution.
+    \item A \textbf{rigorous multi-seed benchmark}: an 18-run ablation matrix (900{,}000 steps), a 7-model benchmark on the Intel Lab, and zero-shot transfer on the MIT Stata Center.
+\end{enumerate}
+
+% ============================================================================
+\section{Related Work}
+
+\subsection{Classical \& Information-Theoretic Exploration}
+Frontier exploration~\cite{yamauchi1997} and vector field histograms~\cite{borenstein1991} guide robots to the boundaries of unknown space. Stachniss et~al.~\cite{stachniss2005} introduced information-theoretic planning that minimizes map entropy and particle covariance, while Umari and Mukhopadhyay~\cite{umari2017} developed RRT-Exploration for stochastic frontier detection. However, as noted in active SLAM surveys~\cite{cadena2016,placed2023}, when sensor noise causes state-estimator drift, classical heuristics frequently stall near obstacle boundaries.
+
+\subsection{Learning-Based Active SLAM}
+Chaplot et~al.~\cite{chaplot2020} introduced Active Neural SLAM using hierarchical networks, while Niroui et~al.~\cite{niroui2019} coupled PPO with frontier exploration in cluttered ruins. Nonetheless, existing DRL methods assume noise-free kinematics during early rollouts, rely on GPU infrastructure, and lack runtime health monitoring. Although Narvekar et~al.~\cite{narvekar2020} formalized curriculum learning, its application to CPU-constrained robotics remains largely unexplored.
+
+\subsection{Gap Addressed by OmniRay}
+Prior works treat reward shaping, curriculum schedules, and replay as static offline hyperparameters. OmniRay introduces runtime health diagnostics to drive closed-loop multi-layer adaptation, enabling stable, GPU-free Active SLAM directly on edge CPUs.
+
+% ============================================================================
+\section{Methodology}
+
+\subsection{POMDP Formulation}
+We model Active SLAM as a POMDP $\langle \mathcal{S}, \mathcal{A}, \mathcal{P}, \mathcal{R}, \Omega, \mathcal{O}, \gamma \rangle$~\cite{kaelbling1998}:
+\begin{itemize}
+    \item \textbf{State} $s_t = \langle \mathbf{x}_t, \mathbf{m}, \mathcal{E}_{\text{known}} \rangle$: true pose, static map, and explored cells.
+    \item \textbf{Observation} $o_t = \langle M_{\text{cov}}^{(t)}, M_{\text{slam}}^{(t)}, z_t, p_t \rangle$: binary coverage grid $M_{\text{cov}} \in \{0,1\}^{100\times100}$, SLAM log-odds grid $M_{\text{slam}} \in \mathbb{R}^{100\times100}$, 128-ray LiDAR sweep $z_t$, and 5-D kinematic pose $p_t$.
+    \item \textbf{Action} $a_t = [v_t, \omega_t]^T \in [-1, 1]^2$, scaled to $v \in [0, 1.2]$\,m/s and $\omega \in [-1.0, 1.0]$\,rad/s.
+    \item \textbf{Reward}:
+    \begin{equation}
+    \label{eq:reward}
+    R_t = w_e \Delta C_t + w_f \Delta F_t - w_c\, I_{\text{col}} - w_t + w_h H_t
+    \end{equation}
+    where $\Delta C_t$ is newly explored cells, $\Delta F_t$ is distance progress toward the nearest frontier, $I_{\text{col}} \in \{0, 1\}$ indicates collision, $H_t \in [0, 1]$ is the system health score, and $w_t = 0.01$ is a step time penalty. Base weights are $w_e = 1.0$, $w_f = 0.10$, $w_c = 0.10$ (scaled up to $3.0\times$ by L2 upon obstacle proximity), and $w_h = 0.10$.
+\end{itemize}
+
+\subsection{Dual-Branch CNN-MLP Encoder}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{architecture_detailed_formulas.png}
+\caption{OmniRay architecture: A 2D CNN processes coverage and SLAM grids ($2\!\times\!100\!\times\!100$) into $\mathbf{h}_{\text{2D}}\!\in\!\mathbb{R}^{128}$; a 1D MLP encodes LiDAR and kinematics into $\mathbf{h}_{\text{1D}}\!\in\!\mathbb{R}^{128}$. The fused vector $\mathbf{z}_t\!\in\!\mathbb{R}^{256}$ feeds actor and critic heads trained via PPO.}
+\label{fig:architecture}
+\end{figure}
+
+The 2D CNN branch applies two convolutional stages ($2\!\to\!16$ and $16\!\to\!32$ filters, $3\!\times\!3$ kernel, stride 2) with batch normalization and ReLU, projected to $\mathbf{h}_{\text{2D}} \in \mathbb{R}^{128}$. The 1D MLP branch encodes the 133-D LiDAR/pose vector via two linear layers ($133 \to 128 \to 128$). Fused embedding $\mathbf{z}_t = [\mathbf{h}_{\text{2D}} \| \mathbf{h}_{\text{1D}}] \in \mathbb{R}^{256}$ feeds actor and critic heads optimized via PPO's clipped objective~\cite{schulman2017}:
+\begin{equation}
+\label{eq:clip}
+\mathcal{L}^{\text{CLIP}} = \hat{\mathbb{E}}_t \!\left[\min\!\left(r_t(\boldsymbol{\theta})\hat{A}_t,\, \text{clip}(r_t(\boldsymbol{\theta}), 1\!-\!\epsilon, 1\!+\!\epsilon)\hat{A}_t\right)\right]
+\end{equation}
+with GAE parameter $\lambda = 0.95$~\cite{schulman2016gae}, discount $\gamma = 0.99$, entropy weight $c_{\text{ent}} = 0.01$, learning rate $\eta = 3 \times 10^{-4}$, and clip threshold $\epsilon = 0.20$.
+
+\subsection{C++ AVX2 SIMD Raycasting Engine}
+To eliminate perception rollout bottlenecks, OmniRay uses a custom C++ raycaster bound via \texttt{pybind11}. For $N_r = 128$ rays over $360^\circ$ against wall segments $(x_1, y_1) \to (x_2, y_2)$, 256-bit AVX2 registers (\texttt{\_\_m256}) evaluate eight ray-segment intersections in parallel:
+\begin{equation}
+\label{eq:ray_intersect}
+t_{ij} = \frac{(x_1\!-\!x)(y_1\!-\!y_2) - (y_1\!-\!y)(x_1\!-\!x_2)}{(\cos\alpha_i)(y_1\!-\!y_2) - (\sin\alpha_i)(x_1\!-\!x_2)}
+\end{equation}
+with segment parameter $u_{ij}$ evaluated via vectorized cross products. Valid intersections satisfy $t_{ij} > 0$ and $u_{ij} \in [0, 1]$. On an Intel i7 CPU, this kernel completes in $\mathbf{37\,\mu}$\textbf{s} per scan vs.\ $962\,\mu$s for scalar C++ (\texttt{-O3 -march=native}), a $25.9\times$ hardware speedup.
+
+\subsection{VectorSLAM Particle Filter}
+Localisation uses \textbf{VectorSLAM}, a vectorized Rao-Blackwellized particle filter~\cite{grisetti2007} and log-odds grid mapper~\cite{elfes1989}. Motion propagation incorporates wheel slip ($\sigma_v = 0.10v, \sigma_\psi = 0.05\omega$). Scans update a log-odds occupancy map ($0.5$\,m/cell). Low-variance resampling executes when effective particles $N_{\text{eff}} < N_p/2$.
+
+\subsection{5-Layer Self-Adaptive Autonomy}
+\begin{enumerate}
+    \item \textbf{L1 Health Monitor}: Tracks $H_t = \lambda_e H_{\text{entropy}} + \lambda_c H_{\text{cov}} + \lambda_s H_{\text{slam}}$, flagging failure when $H_t < 0.50$.
+    \item \textbf{L2 Adaptive Reward}: Multiplies collision penalty by $2\times$ and enhances frontier attraction when $H_t < 0.50$.
+    \item \textbf{L3 Meta-Policy}: Contextual bandit MLP predicting continuous reward adjustments $\Delta\boldsymbol{\theta}_{\text{reward}}$ from moving health diagnostics.
+    \item \textbf{L4 Curriculum Manager}: Adjusts obstacles ($2 \to 12$) and noise ($1\times \to 2\times$) based on rolling performance:
+    \begin{equation}
+    \label{eq:curriculum}
+    D^{(e+1)} = \begin{cases}
+    \min(1, D^{(e)}\!+\!0.05) & \text{if } \bar{R} > R_{\text{target}}, \\
+    \max(0, D^{(e)}\!-\!0.05) & \text{if } H_t < 0.40, \\
+    D^{(e)} & \text{otherwise}.
+    \end{cases}
+    \end{equation}
+    \item \textbf{L5 Continual Learner}: Buffers episode trajectories and triggers 2{,}048-step replay fine-tuning upon sustained health drops ($H_t < 0.35$ over 5 episodes).
+\end{enumerate}
+
+% ============================================================================
+\section{Experimental Setup}
+
+\subsection{Noise Model}
+Following sim-to-real benchmarks~\cite{zhao2020}, we inject: (i)~wheel slip $\sigma_v = 0.10 \cdot v_{\text{cmd}}$ and yaw drift $\sigma_\psi = 0.05 \cdot \omega_{\text{cmd}}$; and (ii)~LiDAR degradation via grazing incidence beam loss ($>75^\circ \to d_{\max} = 30.0$\,m) and 1\% stochastic packet dropouts per scan.
+
+\subsection{Datasets \& Holdout Protocol}
+Implemented in PyTorch and Stable-Baselines3~\cite{raffin2021}:
+\begin{itemize}
+    \item \textbf{Training}: Procedurally generated arenas scaled from 2 to 12 obstacles under the Layer 4 curriculum schedule.
+    \item \textbf{Evaluation (Zero-Shot Holdout)}: Unseen floorplans of the Intel Research Lab ($28\!\times\!28$\,m) and MIT Stata Center ($45\!\times\!35$\,m) under active sensor/actuator noise.
+\end{itemize}
+
+\subsection{Hardware}
+All experiments run on an Intel Core i7 ultrabook CPU ($<$15\,W TDP) without GPU acceleration.
+
+\subsection{Ablation Configurations}
+Six configurations $\times$ 3 seeds (42, 43, 44) $\times$ 50{,}000 steps = 900{,}000 total steps: \texttt{full\_system}, and five single-layer ablations (\texttt{no\_health}, \texttt{no\_adaptive\_reward}, \texttt{no\_meta\_policy}, \texttt{no\_curriculum}, \texttt{no\_continual}).
+
+\subsection{Baselines \& Implementation Details}
+We benchmark OmniRay against six baselines under identical VectorSLAM noise profiles: (i)~Random Walk; (ii)~Yamauchi nearest frontier~\cite{yamauchi1997}; (iii)~RRT-Exploration~\cite{umari2017}; (iv)~Info-Gain $A^*$ (Stachniss et~al.~\cite{stachniss2005}); (v)~Shanghai AI Lab DRL~\cite{wang2024navformer} (a 2-layer MLP without curriculum/adaptive layers); and (vi)~DeepSeek-R1~\cite{deepseek2025} / Qwen2.5-VL~\cite{qwen2025vl} zero-shot VLM embodied frontier reasoning.
+
+% ============================================================================
+\section{Results}
+
+\subsection{Multi-Model Benchmark: Intel Lab}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{multi_model_intel_benchmark_7models.png}
+\caption{Intel Lab benchmark: trajectories (left) and coverage rate vs. execution time (right) under kinodynamic noise across seven evaluated models.}
+\label{fig:intel_benchmark}
+\end{figure}
+
+Table~\ref{tab:intel} benchmarks OmniRay against six baselines under kinodynamic noise. OmniRay achieves $90.87 \pm 3.29\%$ mean coverage with $62.3 \pm 46.5$ collisions---a $67.6\%$ reduction compared to Yamauchi ($192.3 \pm 39.9$). Policy decision latency is $3.09$\,ms ($6.0\times$ faster than Info-Gain $A^*$'s $18.51$\,ms; $10.02$\,ms for the complete SLAM loop). AVX2 SIMD raycasting provides a $25.9\times$ speedup over scalar C++ ($0.038$\,ms vs.\ $0.962$\,ms). While Info-Gain $A^*$ and VLM reasoning avoid collisions entirely, they incur substantial planning latency (up to $650$\,ms for VLM API queries).
+
+\begin{table}[t]
+\caption{Multi-Seed Benchmark --- Intel Research Lab (Mean $\pm$ SD)}
+\label{tab:intel}
+\centering
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{@{}lcccccc@{}}
+\toprule
+\textbf{Model} & \textbf{Cov.} & \textbf{Dist.} & \textbf{Cov./m} & \textbf{Dec. Lat.} & \textbf{RAM} & \textbf{Col.} \\
+ & (\%) & (m) & (\%/m) & (ms) & (MB) & \\
+\midrule
+Random Walk        & $65.55 \pm 12.52$ & $148.57 \pm 67.34$ & 0.441 &    7.16  & \textbf{34.2} & $225.7 \pm 33.7$ \\
+Yamauchi~\cite{yamauchi1997}  & $70.85 \pm 14.67$ & $155.06 \pm 64.90$ & 0.457 & 8.61  & 39.5 & $192.3 \pm 39.9$ \\
+RRT-Expl.~\cite{umari2017}    & $85.55 \pm 13.57$ & $267.64 \pm 33.16$ & 0.320 & 10.49 & 44.8 & $30.7 \pm 28.2$ \\
+Stachniss$^\S$~\cite{stachniss2005}& $\mathbf{95.43 \pm 0.07}$ & $207.65 \pm 22.06$ & \textbf{0.460} & 18.51 & 52.1 & $\mathbf{0.0 \pm 0.0}$ \\
+Shanghai AI Lab DRL~\cite{wang2024navformer} & $46.56 \pm 4.01$ & $74.21 \pm 18.87$ & 0.627 & 12.40 & 128.0 & $263.0 \pm 9.4$ \\
+DeepSeek-R1 / Qwen2.5-VL$^\P$~\cite{deepseek2025,qwen2025vl} & $95.13 \pm 0.08$ & $223.96 \pm 11.19$ & 0.425 & 650.00 & 450.0 & $\mathbf{0.0 \pm 0.0}$ \\
+\midrule
+\textbf{OmniRay (Ours)} & $90.87 \pm 3.29$ & $\mathbf{418.12 \pm 106.25}$ & 0.217 & \textbf{3.09}$^\dagger$ & 41.8 & $62.3 \pm 46.5^\ddagger$ \\
+\bottomrule
+\end{tabular}%
+}
+\vspace{1pt}
+{\raggedright\footnotesize $^\dagger$\,Policy network decision latency ($3.09$\,ms); full SLAM control loop is $10.02$\,ms ($1.8\times$ faster than Info-Gain $A^*$). Core C++ AVX2 raycasting latency is $0.038$\,ms/scan. $^\ddagger$\,Cumulative obstacle contacts per 300-step episode across 3 seeds. $^\S$\,Frontier mutual information with $A^*$ obstacle-inflated navigation~\cite{stachniss2005}. $^\P$\,Zero-shot VLM prompt frontier reasoning (simulated at $650$\,ms roundtrip; memory includes GPU VRAM cache).\par}
+\end{table}
+
+\subsection{Zero-Shot Transfer: MIT Stata Center}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{mit_stata_multi_model_benchmark_7models.png}
+\caption{MIT Stata Center zero-shot benchmark: trajectories (left) and coverage rate vs. wall-clock time (right) evaluated without retraining across seven models.}
+\label{fig:mit_benchmark}
+\end{figure}
+
+OmniRay was evaluated without fine-tuning on the MIT Stata Center (Table~\ref{tab:mit}), reaching $91.08 \pm 3.99\%$ coverage. Collisions are higher than Yamauchi ($70.3 \pm 53.6$ vs.\ $28.3 \pm 20.5$), reflecting narrower corridor constraints.
+
+\begin{table}[t]
+\caption{Zero-Shot Benchmark --- MIT Stata Center (Mean $\pm$ SD)}
+\label{tab:mit}
+\centering
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{@{}lcccccc@{}}
+\toprule
+\textbf{Model} & \textbf{Cov.} & \textbf{Dist.} & \textbf{Cov./m} & \textbf{Dec. Lat.} & \textbf{RAM} & \textbf{Col.} \\
+ & (\%) & (m) & (\%/m) & (ms) & (MB) & \\
+\midrule
+Random Walk        & $59.81 \pm 19.40$ & $140.14 \pm 96.38$ & 0.427 & 7.10  & \textbf{35.1} & $230.0 \pm 48.3$ \\
+Yamauchi~\cite{yamauchi1997}  & $91.04 \pm 4.40$  & $281.62 \pm 37.18$ & 0.323 & 10.29 & 41.2 & $28.3 \pm 20.5$ \\
+RRT-Expl.~\cite{umari2017}    & $\mathbf{95.08 \pm 0.07}$ & $260.61 \pm 2.99$  & 0.365 & 10.77 & 46.5 & $35.0 \pm 4.5$ \\
+Stachniss$^\S$~\cite{stachniss2005}& $94.80 \pm 0.12$  & $215.30 \pm 18.40$  & \textbf{0.440} & 19.80 & 54.0 & $\mathbf{0.0 \pm 0.0}$ \\
+Shanghai AI Lab DRL~\cite{wang2024navformer} & $51.20 \pm 6.80$ & $88.50 \pm 24.10$ & 0.578 & 13.10 & 128.0 & $215.4 \pm 18.2$ \\
+DeepSeek-R1 / Qwen2.5-VL$^\P$~\cite{deepseek2025,qwen2025vl} & $94.65 \pm 0.25$ & $230.15 \pm 14.80$ & 0.411 & 650.00 & 450.0 & $\mathbf{0.0 \pm 0.0}$ \\
+\midrule
+\textbf{OmniRay (Zero-Shot)} & $91.08 \pm 3.99$  & $\mathbf{454.34 \pm 108.03}$ & 0.200 & \textbf{3.09}$^\dagger$ & 41.8 & $70.3 \pm 53.6^\ddagger$ \\
+\bottomrule
+\end{tabular}%
+}
+\vspace{1pt}
+{\raggedright\footnotesize $^\dagger$\,Policy decision latency ($3.09$\,ms); full loop is $10.02$\,ms. Core AVX2 raycaster latency is $0.038$\,ms/scan. $^\ddagger$\,Cumulative collisions per 300 steps. $^\S$\,Info-gain $A^*$~\cite{stachniss2005}. $^\P$\,Zero-shot VLM prompt frontier reasoning.\par}
+\end{table}
+
+\subsection{Cross-Dataset Generalisation Gap}
+Zero-shot evaluation on MIT Stata yields $91.08 \pm 3.99\%$ coverage vs.\ $90.87 \pm 3.29\%$ on Intel Lab ($+0.21$\,pp gap; Table~\ref{tab:gap}). A two-sided Welch's $t$-test indicates no significant degradation ($t(3.86) = 0.07$, $p = 0.95$; 95\% CI: $[-8.09, +8.51]$\,pp), confirming robust spatial transferability.
+
+\begin{table}[t]
+\caption{Cross-Dataset Generalisation Summary (Mean $\pm$ SD)}
+\label{tab:gap}
+\centering
+\begin{tabular}{@{}lcc@{}}
+\toprule
+\textbf{Dataset} & \textbf{Coverage (\%)} & \textbf{Gap} \\
+\midrule
+Intel Research Lab (unseen) & $90.87 \pm 3.29$ & --- \\
+MIT Stata Center (zero-shot) & $91.08 \pm 3.99$ & $+0.21$\,pp \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Multi-Seed Ablation Study}
+
+\begin{figure}[t]
+\centering
+\begin{subfigure}[b]{0.48\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{ablation_3seed_health_score_errorbars.png}
+    \caption{Health score stability.}
+    \label{fig:abl_health}
+\end{subfigure}
+\hfill
+\begin{subfigure}[b]{0.48\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{ablation_3seed_peak_reward_errorbars.png}
+    \caption{Peak reward variance.}
+    \label{fig:abl_reward}
+\end{subfigure}
+\caption{3-seed ablation study (900{,}000 total steps). Disabling L4 (Curriculum) induces the largest reward drop; removing L1 (Health Monitor) collapses health to the 0.500 failure threshold.}
+\label{fig:ablation}
+\end{figure}
+
+Table~\ref{tab:ablation} presents performance across seeds 42, 43, 44. Removing Curriculum Learning (L4) causes a $-16.2\%$ drop in peak reward ($1{,}912 \pm 49$ vs.\ $2{,}282 \pm 93$). Disabling the Health Monitor (L1) collapses health to the $0.500 \pm 0.000$ boundary and increases reward standard deviation by $2.24\times$ ($5.0\times$ in variance). The rolling collision fraction during training rises to $0.14 \pm 0.25$ without L5 continual tracking, vs.\ $0.00 \pm 0.00$ for the Full System. Peak and mean returns for ablated L5 are marked N/A as reward telemetry was routed via L5's replay buffer.
+
+\begin{table}[t]
+\caption{3-Seed Ablation Matrix (Mean $\pm$ SD, 50K steps/run; Train.\ Col.\ Frac.\ denotes rolling collision fraction during training)}
+\label{tab:ablation}
+\centering
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+\textbf{Configuration} & \textbf{Health} & \textbf{Peak Rew.} & \textbf{Mean Rew.} & \textbf{Train.\ Col.\ Frac.} \\
+\midrule
+Full System (5 Layers) & $0.641 \pm 0.003$ & $2282 \pm 93$ & $1228 \pm 71$ & 0.00 \\
+$-$Health Mon. (L1)    & $0.500 \pm 0.000$ & $2096 \pm 62$ & $1092 \pm 159$ & 0.00 \\
+$-$Adapt.\ Reward (L2) & $0.606 \pm 0.078$ & $2161 \pm 145$ & $1009 \pm 81$ & 0.00 \\
+$-$Meta-Policy (L3)    & $0.548 \pm 0.068$ & $2157 \pm 101$ & $1048 \pm 164$ & 0.00 \\
+$-$Curriculum (L4)     & $0.517 \pm 0.070$ & $1912 \pm 49$ & $1173 \pm 129$ & 0.00 \\
+$-$Cont.\ Learner (L5) & $0.564 \pm 0.087$ & N/A & N/A & 0.14 \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+\subsection{Noise Robustness}
+OmniRay was tested under wheel slip ($\sigma_v = 0.10v, \sigma_\psi = 0.05\omega$) and 1\% scan dropout (Fig.~\ref{fig:robust}). VectorSLAM reduces trajectory drift by 76.8\% relative to uncorrected dead-reckoning (ATE RMSE $= 4.08$\,m vs.\ $22.55$\,m), while Layer 1 health monitoring remains safely above the 0.500 threshold across 300 steps.
+
+\begin{figure}[!htbp]
+\centering
+\includegraphics[width=\linewidth]{robust_evaluation_report.png}
+\caption{Robustness on Intel Lab: ground-truth vs. SLAM trajectory, occupancy map, tracking error (76.8\% drift reduction), and Layer 1 health monitoring under active noise.}
+\label{fig:robust}
+\end{figure}
+
+% ============================================================================
+\section{Discussion}
+
+\subsection{Why Curriculum Learning Dominates}
+Ablation results confirm that Layer 4 contributes $+16.2\%$ to peak reward. Exposing the agent to dense obstacles and maximum noise at step 0 inflates advantage estimator variance $\hat{A}_t$, destabilizing policy gradients. Progressive difficulty scaling ($2 \to 12$ obstacles, $1\times \to 2\times$ noise) stabilizes value convergence (explained variance $>0.50$), consistent with curriculum theory~\cite{narvekar2020}.
+
+\subsection{Emergent Spiral Trajectories}
+OmniRay discovers an emergent Archimedean spiral trajectory ($r(\varphi) \approx a + b\varphi$; Fig.~\ref{fig:trajectories}). Continuous forward sweeping ($v > 0$) eliminates sharp $90^\circ$ turn-in-place maneuvers that trigger severe differential-drive wheel slip, while keeping centripetal acceleration below tire traction limits. This allows OmniRay to reach $85\%$ coverage in $<110$ steps ($<3.7$\,s wall-clock) while classical frontier planners stall near obstacles.
+
+\begin{figure}[!htbp]
+\centering
+\includegraphics[width=\linewidth]{yamauchi_vs_omniray_comparison.png}
+\caption{Yamauchi (1997) vs. OmniRay over 300 steps: (left) emergent spiral trajectory avoiding turn-in-place slip; (right) coverage reaching 85\% in under 110 steps while Yamauchi stalls.}
+\label{fig:trajectories}
+\end{figure}
+
+\subsection{Coverage Efficiency vs.\ Perception Latency}
+Info-Gain $A^*$ achieves higher path efficiency ($0.440$--$0.460\,\%$/m) via exhaustive shortest-path planning and costly entropy evaluation ($18.51$\,ms). In contrast, OmniRay prioritizes continuous forward velocity, accepting lower path efficiency ($0.200$--$0.217\,\%$/m) in exchange for sub-$4$\,ms decision latency ($0.038$\,ms raycasting kernel; $3.09$\,ms policy inference) and rapid early-stage coverage (Fig.~\ref{fig:intel_benchmark} right).
+
+\subsection{Lower Coverage Discussion \& Practical Merits}
+Info-Gain $A^*$ achieves higher asymptotic coverage ($95.43\%$ vs.\ $90.87\%$) due to global graph search over distant corners, whereas OmniRay operates on a local sliding window and balances collision risks in narrow corridors within a 300-step horizon. Nevertheless, OmniRay offers decisive deployment advantages:
+(i)~\textit{Deterministic $O(1)$ latency}: Inference cost is constant-time, avoiding the $O(M^2 \log M)$ scaling spikes of grid graph search.
+(ii)~\textit{Graceful degradation}: Model-free reactive policies maintain forward motion under severe slip where graph planners stall in execution loops.
+(iii)~\textit{Autonomous adaptation}: L1--L5 adapt to physical wear and drift without manual parameter tuning.
+
+\subsection{Edge CPU Efficiency}
+AVX2 SIMD raycasting ($37\,\mu\text{s}$) and vectorized NumPy SLAM ($<1.2$\,ms) sustain 35--47 FPS training throughput. A 50K-step model trains in ${\sim}25$ minutes at $<15$\,W, enabling direct edge deployment.
+
+% ============================================================================
+\section{Limitations \& Future Work}
+\begin{enumerate}
+    \item \textbf{2D representation}: Extension to 3D octree representations (OctoMap/Voxblox) for aerial robots is planned.
+    \item \textbf{Physical deployment}: Hardware validation on a physical TurtleBot3 rover in office environments is underway.
+    \item \textbf{Architectural diversity}: Expanding benchmarks to broader multi-building architectural datasets.
+    \item \textbf{Standalone baseline budget}: Evaluating unadapted PPO under identical budgets to further isolate layer gains.
+    \item \textbf{Ablation comparability}: Acknowledging penalty regime variations in ablated reward telemetry.
+    \item \textbf{Quantitative spiral fit}: Incorporating formal angular curvature regression to quantify emergent spirals.
+\end{enumerate}
+
+% ============================================================================
+\section{Conclusion}
+We presented \textbf{OmniRay}, an ultra-lightweight, CPU-native Active SLAM framework for edge robotics. By coupling a 256-bit C++ AVX2/NEON raycaster ($37\,\mu\text{s}$ per scan; $25.9\times$ speedup) with a 5-layer self-adaptive autonomy stack, OmniRay eliminates GPU dependencies and sustains 35--47 FPS training on low-power CPUs ($<$15\,W). The learned policy exhibits emergent spiral exploration that avoids turn-in-place wheel slip, reaching $90.87 \pm 3.29\%$ coverage on the Intel Lab with 67.6\% fewer collisions than Yamauchi (1997) and zero-shot transfer ($91.08 \pm 3.99\%$) on the unseen MIT Stata Center at constant-time $3.09$\,ms decision latency. OmniRay provides a deterministic, low-power foundation for scalable edge Active SLAM.
+
+% ============================================================================
+\begin{thebibliography}{99}
+
+\bibitem{yamauchi1997}
+B.~Yamauchi, ``A frontier-based approach for autonomous exploration,'' in \textit{Proc. IEEE Int. Symp. Comput. Intell. Robot. Autom. (CIRA)}, 1997, pp. 146--151.
+
+\bibitem{stachniss2005}
+C.~Stachniss, G.~Grisetti, and W.~Burgard, ``Information-gain-based exploration using Rao-Blackwellized particle filters,'' in \textit{Proc. Robot.: Sci. Syst. (RSS)}, 2005, pp. 65--72.
+
+\bibitem{umari2017}
+H.~Umari and S.~Mukhopadhyay, ``Autonomous robotic exploration based on multiple rapidly-exploring randomized trees,'' in \textit{Proc. IEEE/RSJ Int. Conf. Intell. Robots Syst. (IROS)}, 2017, pp. 1396--1402.
+
+\bibitem{chaplot2020}
+D.~S.~Chaplot, D.~Gandhi, S.~Gupta, A.~Gupta, and R.~Salakhutdinov, ``Learning to explore using active neural SLAM,'' in \textit{Proc. Int. Conf. Learn. Represent. (ICLR)}, 2020, pp. 1--17.
+
+\bibitem{niroui2019}
+F.~Niroui, K.~Zhang, Z.~Kashino, and G.~Nejat, ``Deep reinforcement learning robot for search and rescue applications: Exploration in unknown cluttered environments,'' \textit{IEEE Robot. Autom. Lett.}, vol. 4, no. 2, pp. 610--617, 2019.
+
+\bibitem{thrun2005}
+S.~Thrun, W.~Burgard, and D.~Fox, \textit{Probabilistic Robotics}. Cambridge, MA: MIT Press, 2005.
+
+\bibitem{cadena2016}
+C.~Cadena \textit{et~al.}, ``Past, present, and future of simultaneous localization and mapping: Toward the robust-perception age,'' \textit{IEEE Trans. Robot.}, vol. 32, no. 6, pp. 1309--1332, 2016.
+
+\bibitem{schulman2017}
+J.~Schulman, F.~Wolski, P.~Dhariwal, A.~Radford, and O.~Klimov, ``Proximal policy optimization algorithms,'' \textit{arXiv:1707.06347}, 2017.
+
+\bibitem{narvekar2020}
+S.~Narvekar \textit{et~al.}, ``Curriculum learning for reinforcement learning domains: A framework and survey,'' \textit{J. Mach. Learn. Res.}, vol. 21, no. 181, pp. 1--50, 2020.
+
+\bibitem{placed2023}
+J.~A.~Placed \textit{et~al.}, ``A survey on active simultaneous localization and mapping: State of the art and new frontiers,'' \textit{IEEE Trans. Robot.}, vol. 39, no. 3, pp. 1686--1705, 2023.
+
+\bibitem{grisetti2007}
+G.~Grisetti, C.~Stachniss, and W.~Burgard, ``Improved techniques for grid mapping with Rao-Blackwellized particle filters,'' \textit{IEEE Trans. Robot.}, vol. 23, no. 1, pp. 34--46, 2007.
+
+\bibitem{elfes1989}
+A.~Elfes, ``Using occupancy grids for mobile robot perception and navigation,'' \textit{IEEE Computer}, vol. 22, no. 6, pp. 46--57, 1989.
+
+\bibitem{borenstein1991}
+J.~Borenstein and Y.~Koren, ``The vector field histogram-fast obstacle avoidance for mobile robots,'' \textit{IEEE Trans. Robot. Autom.}, vol. 7, no. 3, pp. 278--288, 1991.
+
+\bibitem{savva2019}
+M.~Savva \textit{et~al.}, ``Habitat: A platform for embodied AI research,'' in \textit{Proc. IEEE/CVF Int. Conf. Comput. Vis. (ICCV)}, 2019, pp. 9339--9347.
+
+\bibitem{zhao2020}
+W.~Zhao, J.~P.~Queralta, and T.~Westerlund, ``Sim-to-real transfer in deep reinforcement learning for robotics: A survey,'' \textit{IEEE Comput. Intell. Mag.}, vol. 15, no. 2, pp. 35--49, 2020.
+
+\bibitem{makoviychuk2021}
+V.~Makoviychuk \textit{et~al.}, ``Isaac Gym: High performance GPU-based physics simulation for robot learning,'' \textit{arXiv:2108.10470}, 2021.
+
+\bibitem{raffin2021}
+A.~Raffin \textit{et~al.}, ``Stable-Baselines3: Reliable reinforcement learning implementations in Python,'' \textit{J. Mach. Learn. Res.}, vol. 22, no. 268, pp. 1--8, 2021.
+
+\bibitem{wang2024navformer}
+C.~Wang, J.~Shen, and X.~Li, ``NavFormer: Neural active exploration with spatial transformers,'' in \textit{Proc. IEEE/CVF Conf. Comput. Vis. Pattern Recognit. (CVPR)}, 2024, pp. 16212--16221.
+
+\bibitem{kaelbling1998}
+L.~P.~Kaelbling, M.~L.~Littman, and A.~R.~Cassandra, ``Planning and acting in partially observable stochastic domains,'' \textit{Artif. Intell.}, vol. 101, no. 1--2, pp. 99--134, 1998.
+
+\bibitem{schulman2016gae}
+J.~Schulman, P.~Moritz, S.~Levine, M.~Jordan, and P.~Abbeel, ``High-dimensional continuous control using generalized advantage estimation,'' in \textit{Proc. Int. Conf. Learn. Represent. (ICLR)}, 2016, pp. 1--14.
+
+\bibitem{welch1947}
+B.~L.~Welch, ``The generalization of `Student's' problem when several different population variances are involved,'' \textit{Biometrika}, vol. 34, no. 1/2, pp. 28--35, 1947.
+
+\bibitem{deepseek2025}
+DeepSeek-AI, ``DeepSeek-R1: Incentivizing reasoning capability in LLMs via reinforcement learning,'' \textit{arXiv:2501.12948}, 2025.
+
+\bibitem{qwen2025vl}
+Qwen Team, ``Qwen2.5-VL technical report,'' \textit{arXiv:2502.13923}, 2025.
+
+\end{thebibliography}
+
+\end{document}
