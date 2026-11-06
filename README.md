@@ -6,7 +6,7 @@
   <strong>Author:</strong> Kingshuk Chatterjee &nbsp;|&nbsp;
   <strong>Co-Author:</strong> Ayush Ranjan &nbsp;|&nbsp;
   <strong>Co-Author:</strong> Raghav Singh Parihar
-</p>
+  <strong>Co-Author:</strong> N Sangita Achary (Assistant professor)
 
 ---
 
